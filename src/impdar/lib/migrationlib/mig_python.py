@@ -692,5 +692,288 @@ def getVelocityMatrix(dat, vels_in):
         vmig[:, i] = 2 * np.gradient(depth, twtt)
     return vmig
 
+def migrationKirchhoffPython_2(dat, vel=1.69e8, nearfield=False, progress=100, use_aperture=None,
+                               aperture_angle_deg=None, fresnel=True, f0=None, fresnel_factor=1.0):
+    """Optimized pure-Python Kirchhoff migration (same physics as migrationKirchhoff).
+
+    Added options:
+    aperture_angle_deg : float | None
+        Half-cone angle (degrees) describing EM radiation / reception cone. Depth-dependent lateral
+        limit = z * tan(theta). Covers unshielded (large angle ~80-90) to strongly shielded (small angle ~10-20).
+    fresnel : bool
+        If True and f0 provided, also compute first Fresnel radius R_F = sqrt( (vel/f0)*z / 2 ) and use
+        effective lateral limit = min(angle_limit, fresnel_factor * R_F) (if angle given) or just fresnel limit.
+    f0 : float | None
+        Dominant frequency (Hz) for Fresnel calculation (required if fresnel True and fresnel constraint desired).
+    fresnel_factor : float
+        Multiplier on Fresnel radius (e.g. 1.0–2.0) to widen or tighten.
+
+    Irregular spacing handling (NEW):
+        Lateral quadrature weights w are applied so the lateral integral approximates ∫ A(x) dx for non-uniform x.
+        w[0] = x1-x0, w[-1] = x_{N-1}-x_{N-2}, interior w_i = 0.5*(x_{i+1}-x_{i-1}).
+
+    Units:
+        Input dat.dist expected in kilometers (legacy ImpDAR convention). Internally converted to meters (dist_m = dat.dist * 1e3)
+        for geometric calculations and weighting.
+
+    Priority of lateral limiting per depth ti:
+        1. If aperture_angle_deg or fresnel constraints given -> depth-dependent mask.
+        2. Else if use_aperture (global meters) -> constant mask each trace.
+        3. Else full aperture.
+    """
+    _check_data_shape(dat)
+    print('Optimized Kirchhoff Migration (Python) of %.0fx%.0f matrix' % (dat.snum, dat.tnum))
+    import numpy as _np, time as _time, math as _math
+    start = _time.time()
+
+    tt_sec = _np.ascontiguousarray(dat.travel_time.ravel(), dtype=_np.float64) / 1.0e6
+    snum = dat.snum; tnum = dat.tnum
+    if tt_sec.shape[0] != snum:
+        raise ValueError('travel_time length mismatch')
+    zs = vel * tt_sec / 2.0
+    zs2 = zs * zs
+    max_travel_time = tt_sec[-1]
+    # Convert km -> m explicitly
+    dist_m = _np.ascontiguousarray(dat.dist, dtype=_np.float64) * 1.0e3
+    if dist_m.shape[0] != tnum:
+        raise ValueError('dist length mismatch')
+    gradD = _np.gradient(_np.ascontiguousarray(dat.data, dtype=_np.float64), tt_sec, axis=0)
+    data_in = _np.ascontiguousarray(dat.data, dtype=_np.float64) if nearfield else None
+    migdata = _np.zeros_like(gradD, dtype=_np.float64)
+    two_over_vel = 2.0 / vel; inv_2pi = 1.0 / (2.0 * _np.pi)
+
+    if aperture_angle_deg is not None:
+        theta_rad = _math.radians(aperture_angle_deg)
+        angle_limits = zs * _math.tan(theta_rad)
+    else:
+        angle_limits = None
+    if fresnel and f0 is not None and f0 > 0:
+        wavelength = vel / f0
+        fresnel_limits = _np.sqrt((wavelength * zs) / 2.0) * fresnel_factor
+    else:
+        fresnel_limits = None
+
+    def _depth_limit(idx_depth):
+        al = angle_limits[idx_depth] if angle_limits is not None else None
+        fl = fresnel_limits[idx_depth] if fresnel_limits is not None else None
+        if al is not None and fl is not None:
+            return min(al, fl)
+        return al if al is not None else fl
+
+    def _nearest_time_indices(times_target):
+        idx = _np.searchsorted(tt_sec, times_target, side='left')
+        over = idx >= snum; idx[over] = snum - 1
+        mask = idx > 0
+        left = idx - 1
+        dt_r = _np.abs(tt_sec[idx] - times_target)
+        dt_l = _np.empty_like(dt_r); dt_l[:] = _np.inf; dt_l[mask] = _np.abs(tt_sec[left[mask]] - times_target[mask])
+        use_left = dt_l < dt_r; idx[use_left] = left[use_left]
+        return idx
+
+    use_ap = use_aperture if (use_aperture is not None and use_aperture > 0) else None
+
+    for xi in range(tnum):
+        if progress and (xi % progress == 0):
+            elapsed = _time.time() - start
+            eta = (elapsed * (tnum - xi) / xi) if xi > 0 else 0.0
+            print(f'Trace {xi}/{tnum}  elapsed {elapsed:.1f}s ETA {eta:.1f}s')
+        # Precompute full trace index arrays for no-aperture/global-aperture cases
+        full_idx = _np.arange(tnum)
+        if use_ap is not None and angle_limits is None and fresnel_limits is None:
+            mask_global = _np.abs(dist_m - dist_m[xi]) <= use_ap
+            dist_global = dist_m[mask_global]
+            idx_global = full_idx[mask_global]
+        for ti in range(snum):
+            # Determine lateral subset for this depth
+            if angle_limits is not None or fresnel_limits is not None:
+                L = _depth_limit(ti)
+                if L is None:  # fallback to global / full
+                    if use_ap is not None:
+                        mask_tr = _np.abs(dist_m - dist_m[xi]) <= use_ap
+                        dist_sel = dist_m[mask_tr]; trace_idx = full_idx[mask_tr]
+                    else:
+                        dist_sel = dist_m; trace_idx = full_idx
+                else:
+                    mask_tr = _np.abs(dist_m - dist_m[xi]) <= L
+                    if not mask_tr.any():
+                        continue
+                    dist_sel = dist_m[mask_tr]; trace_idx = full_idx[mask_tr]
+            else:
+                if use_ap is not None:
+                    dist_sel = dist_global; trace_idx = idx_global
+                else:
+                    dist_sel = dist_m; trace_idx = full_idx
+
+            dx = dist_sel - dist_m[xi]; dx2 = dx * dx
+            rs = _np.sqrt(dx2 + zs2[ti])
+            t_hyp = two_over_vel * rs
+            outside = t_hyp > max_travel_time
+            if outside.all():
+                continue
+            idx_time = _nearest_time_indices(t_hyp)
+            if outside.any():
+                idx_time[outside] = 0
+            with _np.errstate(invalid='ignore', divide='ignore'):
+                costheta = zs[ti] / rs
+            if outside.any():
+                costheta[outside] = 0.0
+            grad_slice = gradD[idx_time, trace_idx]
+            grad_slice[outside] = 0.0
+            # Lateral quadrature weights for irregular spacing (meters)
+            nloc = dist_sel.size
+            if nloc == 1:
+                w = _np.array([0.0], dtype=dist_sel.dtype)
+            elif nloc == 2:
+                w = _np.empty(2, dtype=dist_sel.dtype); w[:] = dist_sel[1] - dist_sel[0]
+            else:
+                w = _np.empty(nloc, dtype=dist_sel.dtype)
+                w[0] = dist_sel[1] - dist_sel[0]
+                w[-1] = dist_sel[-1] - dist_sel[-2]
+                w[1:-1] = 0.5 * (dist_sel[2:] - dist_sel[:-2])
+            if outside.any():
+                w[outside] = 0.0
+            integral = _np.nansum(grad_slice * costheta / vel * w)
+            if nearfield:
+                data_slice = data_in[idx_time, trace_idx]
+                data_slice[outside] = 0.0
+                with _np.errstate(divide='ignore', invalid='ignore'):
+                    integral += _np.nansum(data_slice * costheta / (rs * rs) * w)
+            migdata[ti, xi] = inv_2pi * integral
+
+    dat.data = migdata
+    print('\nOptimized Kirchhoff Migration complete in %.2f seconds' % (time.time() - start))
+    return dat
+
+
+try:
+    import numba as _nb
+    _NUMBA_OK = True
+except Exception:
+    _NUMBA_OK = False
+
+
+if _NUMBA_OK:
+    @_nb.njit(parallel=True, fastmath=True)
+    def _kirchhoff_numba_kernel(migdata,
+                                gradD,
+                                data_in,
+                                dist_m,
+                                zs,
+                                zs2,
+                                vel,
+                                tt0,
+                                dt,
+                                max_travel_time,
+                                nearfield,
+                                depth_limits):
+        # Numba kernel with lateral weighting and explicit km->m conversion already applied before call.
+        inv_2pi = 1.0 / (2.0 * 3.141592653589793)
+        two_over_vel = 2.0 / vel
+        snum = zs.shape[0]
+        tnum = dist_m.shape[0]
+        for xi in _nb.prange(tnum):
+            x0 = dist_m[xi]
+            for ti in range(snum):
+                z = zs[ti]; z2 = zs2[ti]
+                lateral_limit = depth_limits[ti]
+                integral = 0.0
+                for direction in (0, 1):
+                    if direction == 0:
+                        k = xi; step = 1; stop_cond = tnum
+                    else:
+                        k = xi - 1; step = -1; stop_cond = -1
+                    while k != stop_cond:
+                        dx = dist_m[k] - x0
+                        if lateral_limit >= 0.0 and (dx > lateral_limit or dx < -lateral_limit):
+                            break
+                        rs = (dx * dx + z2) ** 0.5
+                        t_hyp = two_over_vel * rs
+                        if t_hyp > max_travel_time:
+                            break
+                        it = int((t_hyp - tt0) / dt + 0.5)
+                        if it < 0:
+                            it = 0
+                        elif it >= snum:
+                            it = snum - 1
+                        if rs > 0.0:
+                            costheta = z / rs
+                        else:
+                            costheta = 0.0
+                        # Lateral weight (irregular spacing) from full grid
+                        if k == 0:
+                            if tnum > 1:
+                                w = dist_m[1] - dist_m[0]
+                            else:
+                                w = 0.0
+                        elif k == tnum - 1:
+                            w = dist_m[tnum - 1] - dist_m[tnum - 2]
+                        else:
+                            w = 0.5 * (dist_m[k + 1] - dist_m[k - 1])
+                        integral += gradD[it, k] * costheta / vel * w
+                        if nearfield:
+                            integral += data_in[it, k] * costheta / (rs * rs) * w
+                        k += step
+                migdata[ti, xi] = inv_2pi * integral
+
+
+def migrationKirchhoffPython_numba(dat,
+                                   vel=1.69e8,
+                                   nearfield=False,
+                                   aperture_angle_deg=None,
+                                   fresnel=True,
+                                   f0=None,
+                                   fresnel_factor=1.0,
+                                   use_aperture=None):
+    """Numba-accelerated Kirchhoff migration (with lateral weighting for irregular spacing).
+
+    Physics: identical to migrationKirchhoffPython_2 (far-field + optional near-field) plus depth-dependent aperture.
+
+    Units:
+        Input dat.dist expected in kilometers. Internally converted to meters (dist_m = dat.dist * 1e3).
+        All geometric / weighting calculations use meters.
+
+    Weighting:
+        Applies lateral quadrature weights w to approximate integral over x for irregular spacing.
+    """
+    if not _NUMBA_OK:
+        raise RuntimeError("Numba not available. Install numba or use migrationKirchhoffPython_2.")
+    _check_data_shape(dat)
+    print(f'Numba Kirchhoff Migration of {dat.snum}x{dat.tnum} matrix')
+    tt_sec = dat.travel_time.astype(np.float64) / 1.0e6
+    dt = float(tt_sec[1] - tt_sec[0]); tt0 = float(tt_sec[0])
+    snum = dat.snum; tnum = dat.tnum
+    zs = vel * tt_sec / 2.0; zs2 = zs * zs
+    max_travel_time = tt_sec[-1]
+    # Explicit km -> m conversion
+    dist_m = np.asarray(dat.dist, dtype=np.float64) * 1.0e3
+    gradD = np.gradient(dat.data.astype(np.float64), tt_sec, axis=0)
+    data_in = dat.data.astype(np.float64) if nearfield else np.zeros_like(gradD)
+    depth_limits = np.full(snum, -1.0, dtype=np.float64)
+    use_angle = aperture_angle_deg is not None
+    use_fresnel = fresnel and (f0 is not None) and (f0 > 0.0)
+    angle_limits = None; fresnel_limits = None
+    if use_angle:
+        theta = np.deg2rad(aperture_angle_deg); angle_limits = zs * np.tan(theta)
+    if use_fresnel:
+        wavelength = vel / f0; fresnel_limits = np.sqrt((wavelength * zs) / 2.0) * fresnel_factor
+    if angle_limits is not None or fresnel_limits is not None:
+        for i in range(snum):
+            a = angle_limits[i] if angle_limits is not None else None
+            fR = fresnel_limits[i] if fresnel_limits is not None else None
+            if a is not None and fR is not None:
+                depth_limits[i] = min(a, fR)
+            elif a is not None:
+                depth_limits[i] = a
+            elif fR is not None:
+                depth_limits[i] = fR
+    elif use_aperture is not None and use_aperture > 0:
+        depth_limits[:] = use_aperture
+    migdata = np.zeros_like(gradD, dtype=np.float64)
+    t0 = time.time()
+    _kirchhoff_numba_kernel(migdata, gradD, data_in, dist_m, zs, zs2, vel, tt0, dt, max_travel_time, nearfield, depth_limits)
+    dat.data = migdata
+    print(f'Numba Kirchhoff complete in {time.time() - t0:.2f}s')
+    return dat
+
 
 
