@@ -212,7 +212,7 @@ def migrationStolt(dat,vel=1.68e8,htaper=100,vtaper=1000):
     return dat
 
 
-def migrationPhaseShift(dat,vel=1.69e8,vel_fn=None,htaper=100,vtaper=1000,nextPowerVal=1, **genfromtxt_kwargs):
+def migrationPhaseShift(dat,vel=1.69e8,vel_fn=None,htaper=100,vtaper=1000,nextPowerVal=1,pad_spatial=False,nextPowerValSpatial=1, **genfromtxt_kwargs):
     """
 
     Phase-Shift Migration
@@ -239,7 +239,9 @@ def migrationPhaseShift(dat,vel=1.69e8,vel_fn=None,htaper=100,vtaper=1000,nextPo
         Array structure is velocities in first column, z location in second, x location in third.
         If uniform velocity (i.e. vel=constant) input constant
         If layered velocity (i.e. vel=v(z)) input array with shape (#vel-points, 2) (i.e. no x-values)
-    nextPowerVal: integer power of 2 for padding the number of traces (i.e. 1=2, 2=4, 3=8, etc)    
+    nextPowerVal: integer power of 2 for padding the time dimension (i.e. 1=2, 2=4, 3=8, etc)    
+    pad_spatial: boolean, apply zero-padding in spatial (trace) dimension (default: False)
+    nextPowerValSpatial: integer power of 2 for spatial padding (i.e. 1=2, 2=4, 3=8, etc). Only used if pad_spatial=True (default: 1)
     vel_fn: filename for layered velocity input, .txt file with columns for v, x, z
 
     Output
@@ -261,18 +263,20 @@ def migrationPhaseShift(dat,vel=1.69e8,vel_fn=None,htaper=100,vtaper=1000,nextPo
     v[v>1.] = 1.
     H,V = np.meshgrid(h,v)
     dat.data *= H*V
-    # pad the array with zeros up to the next power of 2 for discrete fft
+    # pad the array with zeros up to the next power of 2 for discrete fft (time dimension)
     nt = 2**(nextPowerVal-1)*2**(np.ceil(np.log(dat.snum)/np.log(2))).astype(int)
+    # pad spatial dimension if requested
+    nt_spatial = 2**(nextPowerValSpatial-1)*2**(np.ceil(np.log2(dat.tnum))).astype(int) if pad_spatial else dat.tnum
     # get frequencies and wavenumbers
     if np.mean(dat.trace_int) <= 0:
         Warning("The trace spacing, variable 'dat.trace_int', should be greater than 0. Using gradient(dat.dist) instead.")
         trace_int = np.gradient(dat.dist)
     else:
         trace_int = dat.trace_int
-    kx = 2.*np.pi*np.fft.fftfreq(dat.tnum,d=np.mean(trace_int))
+    kx = 2.*np.pi*np.fft.fftfreq(nt_spatial,d=np.mean(trace_int))
     ws = 2.*np.pi*np.fft.fftfreq(nt,d=dat.dt)
     # 2D Forward Fourier Transform to get data in frequency-wavenumber space, FK = D(kx,z=0,ws)
-    FK = np.fft.fft2(dat.data,(nt,dat.tnum))
+    FK = np.fft.fft2(dat.data,(nt,nt_spatial))
     # Velocity structure from input
     if vel_fn is not None:
         try:
@@ -288,7 +292,9 @@ def migrationPhaseShift(dat,vel=1.69e8,vel_fn=None,htaper=100,vtaper=1000,nextPo
     # Migration by phase shift, frequency-wavenumber (FKx) to time-wavenumber (TKx)
     TK = phaseShift(dat, vmig, vel, kx, ws, FK)
     # Transform from time-wavenumber (TKx) to time-space (TX) domain to get migrated section
-    dat.data = np.fft.ifft(TK).real
+    migrated = np.fft.ifft(TK).real
+    # Trim to original spatial size (in case spatial padding was used)
+    dat.data = migrated[:,:dat.tnum]
     # print the total time
     print('')
     print('Phase-Shift Migration of %.0fx%.0f matrix complete in %.2f seconds'
@@ -495,8 +501,6 @@ def phaseShift(dat, vmig, vels_in, kx, ws, FK):
                 # sum over all frequencies
                 TK[itau] += FK[iw]
 
-    # Cut to original array size
-    TK = TK[:,:dat.tnum]
     # Normalize for inverse FFT
     TK /= dat.snum
     return TK
